@@ -6,7 +6,7 @@ This folder contains R scripts used for methodological development and sensitivi
 Compares five approaches for calculating mandibular out-lever lengths: direct (DI), alveolar plane (AV), Frankfort Horizontal plane (FH), and occlusal plane (OC), and an average of the Frankfurt and alveolar measurements (F/A)
 
 ### `Study 4 Muscle CSA measurement validation.R`
-Evaluates whether protocols for calculating muscle CA from CT scans is applicable for an ontogenetic sample.
+Evaluates whether protocols for calculating muscle CSA from adult human CT scans is applicable for an ontogenetic sample.
 
 ## Data
 
