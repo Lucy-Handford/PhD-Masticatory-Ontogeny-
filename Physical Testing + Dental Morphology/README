@@ -1,1 +1,9 @@
+This folder contains R scripts used for the physical testing and dental morphology quantification components of this thesis, which includes methodological development and sensitivity analyses described in Chapter 4 and full work flows described in Chapter 5.
 
+Scripts
+
+  Chapter 4 Methods Development
+  - Morphology Validation and Sensitivity includes the script for sensitivity and vaidation studies described in chapter 4.
+
+  Chapter 5 Investigating Dental Form-Function Relationships
+  - This includes the Full Dental Morphology Workflow for calculation of: tooth dimensions, intercuspal distances, cusp radius of curvature (RoC), cusp subtended angle (SA) and incisor CSA.
