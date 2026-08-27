@@ -1,0 +1,1629 @@
+# =============================================================================
+# Dental morphology quantification workflow
+# =============================================================================
+# Purpose
+# -------
+# Reusable workflow for calculating dental morphology from a landmark CSV and
+# corresponding upper/lower 3D dental meshes. The final validated settings used
+# in the thesis are applied directly here.
+#
+# Outputs include:
+#   * mesiodistal (MD) and buccolingual (BL) dimensions
+#   * intercuspal distances
+#   * cusp radius of curvature (RoC)
+#   * cusp subtended angle (SA)
+#   * incisor cross-sectional area (CSA)
+#   * quality-control flags for RoC/SA calculations
+#
+# This script is intended for applying the final workflow. The separate
+# validation_and_sensitivity_analysis.R script documents the methodological
+# validation, repeatability and parameter-sensitivity analyses used to establish
+# the settings implemented here.
+#
+# Input requirements
+# ------------------
+# Landmark CSV: must contain the columns
+#   Specimen, Model, replicate, side, tooth, landmark, x, y, z
+# and use the landmark names expected by the functions below.
+#
+# Meshes: upper and lower dental models must be STL files in the same coordinate
+# system as the landmark data. Model values in the landmark CSV are expected to
+# correspond to "Upper" and "Lower".
+#
+# IMPORTANT: replace the example file paths in USER INPUTS with your own files.
+
+# ---------------------------
+# Packages
+# ---------------------------
+required_packages <- c("dplyr", "tidyr", "purrr", "ggplot2", "Rvcg")
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages) > 0) {
+  stop(
+    "Install the following packages before running this script: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(ggplot2)
+  library(Rvcg)
+})
+
+# =============================================================================
+# USER INPUTS
+# =============================================================================
+# These values can also be defined before sourcing this script. This is useful
+# when the workflow is called from the separate validation script.
+
+if (!exists("landmark_file")) {
+  landmark_file <- "Data/D1.csv"
+}
+if (!exists("upper_mesh_file")) {
+  upper_mesh_file <- "Data/D1_Upper.stl"
+}
+if (!exists("lower_mesh_file")) {
+  lower_mesh_file <- "Data/D1_lower.stl"
+}
+if (!exists("output_dir")) {
+  output_dir <- "Results"
+}
+
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+required_files <- c(landmark_file, upper_mesh_file, lower_mesh_file)
+missing_files <- required_files[!file.exists(required_files)]
+if (length(missing_files) > 0) {
+  stop(
+    "The following required input files were not found:\n",
+    paste0("  - ", missing_files, collapse = "\n"),
+    "\n\nEdit the USER INPUTS section at the top of the script."
+  )
+}
+
+# ---------------------------
+# Final validated parameters
+# ---------------------------
+CAP_SCALE <- 0.15
+ROC_CUTOFF <- 0.60
+ANGLE_CUTOFF <- 0.60
+N_OUTER_POINTS <- 5
+CSA_SECTION_SCALE <- 0.80
+CSA_BBOX_BUFFER <- 0.10
+
+# ---------------------------
+# Load primary landmark data
+# ---------------------------
+data <- read.csv(landmark_file, header = TRUE)
+
+# ---------------------------
+# Calculating Vectors----
+# ---------------------------
+calc_vectors <- function(df) {
+  
+  df %>%
+    group_by(Specimen, Model, replicate, side, tooth) %>%
+    
+    tidyr::complete(
+      landmark = c(
+        "apex",
+        "gumline",
+        "mesial", "distal",
+        "buccal", "lingual",
+        "B1", "B2", "B3",
+        "L1", "L2", "L3"
+      )
+    ) %>%
+    ungroup() %>%
+    
+    pivot_wider(
+      names_from = landmark,
+      values_from = c(x, y, z),
+      values_fill = NA
+    ) %>%
+    
+    mutate(
+      
+      # ---------------------------
+      # 1. MD vector
+      # ---------------------------
+      MD_x = x_distal - x_mesial,
+      MD_y = y_distal - y_mesial,
+      MD_length = sqrt(MD_x^2 + MD_y^2),
+      
+      MD_unit_x = MD_x / MD_length,
+      MD_unit_y = MD_y / MD_length,
+      
+      # ---------------------------
+      # 2. BL axis
+      # ---------------------------
+      BL_x = -MD_unit_y,
+      BL_y =  MD_unit_x,
+      
+      # ---------------------------
+      # 3. BL projections
+      # ---------------------------
+      buccal_proj = (x_buccal * BL_x) + (y_buccal * BL_y),
+      lingual_proj = (x_lingual * BL_x) + (y_lingual * BL_y),
+      
+      BL_length = abs(buccal_proj - lingual_proj),
+      
+      # ---------------------------
+      # 4. Choose distal-most buccal/lingual cusp
+      # ---------------------------
+      
+      B_distal_x = ifelse(!is.na(x_B3), x_B3, x_B2),
+      B_distal_y = ifelse(!is.na(y_B3), y_B3, y_B2),
+      
+      L_distal_x = ifelse(!is.na(x_L3), x_L3, x_L2),
+      L_distal_y = ifelse(!is.na(y_L3), y_L3, y_L2),
+      
+      # ---------------------------
+      # 5. Intercuspal distances----
+      # ---------------------------
+      
+      B_cusp_span = ifelse(
+        is.na(x_B1) | is.na(B_distal_x),
+        NA,
+        sqrt((x_B1 - B_distal_x)^2 +
+               (y_B1 - B_distal_y)^2)
+      ),
+      
+      L_cusp_span = ifelse(
+        is.na(x_L1) | is.na(L_distal_x),
+        NA,
+        sqrt((x_L1 - L_distal_x)^2 +
+               (y_L1 - L_distal_y)^2)
+      ),
+      
+      mesial_BL_cusp_distance = ifelse(
+        is.na(x_B1) | is.na(x_L1),
+        NA,
+        sqrt((x_B1 - x_L1)^2 +
+               (y_B1 - y_L1)^2)
+      ),
+      
+      distal_BL_cusp_distance = ifelse(
+        is.na(B_distal_x) | is.na(L_distal_x),
+        NA,
+        sqrt((B_distal_x - L_distal_x)^2 +
+               (B_distal_y - L_distal_y)^2)
+      ),
+      
+      diagonal_B1_Ldistal = ifelse(
+        is.na(x_B1) | is.na(L_distal_x),
+        NA,
+        sqrt((x_B1 - L_distal_x)^2 +
+               (y_B1 - L_distal_y)^2)
+      ),
+      
+      diagonal_Bdistal_L1 = ifelse(
+        is.na(B_distal_x) | is.na(x_L1),
+        NA,
+        sqrt((B_distal_x - x_L1)^2 +
+               (B_distal_y - y_L1)^2)
+      )
+      
+    ) %>%
+    ungroup()
+}
+
+df_results <- calc_vectors(data)
+
+# ---------------------------
+# Correct regional cusp distances
+# dp3+dp4 and P1+P2
+# ---------------------------
+
+make_decid_premolar_region <- function(data) {
+  
+  data %>%
+    filter(tooth %in% c("dp3", "dp4")) %>%
+    rename(tooth_id = tooth) %>%
+    group_by(Specimen, Model, replicate, side) %>%
+    filter(all(c("dp3", "dp4") %in% tooth_id)) %>%
+    summarise(
+      Dentition = "Deciduous",
+      
+      MD_length = sum(MD_length, na.rm = TRUE),
+      BL_length = mean(BL_length, na.rm = TRUE),
+      
+      dp3_x_B1 = first(x_B1[tooth_id == "dp3"]),
+      dp3_y_B1 = first(y_B1[tooth_id == "dp3"]),
+      dp3_x_L1 = first(x_L1[tooth_id == "dp3"]),
+      dp3_y_L1 = first(y_L1[tooth_id == "dp3"]),
+      
+      dp4_x_Bdist = first(B_distal_x[tooth_id == "dp4"]),
+      dp4_y_Bdist = first(B_distal_y[tooth_id == "dp4"]),
+      dp4_x_Ldist = first(L_distal_x[tooth_id == "dp4"]),
+      dp4_y_Ldist = first(L_distal_y[tooth_id == "dp4"]),
+      
+      dp3_mesial_BL = first(mesial_BL_cusp_distance[tooth_id == "dp3"]),
+      dp4_distal_BL = first(distal_BL_cusp_distance[tooth_id == "dp4"]),
+      
+      .groups = "drop"
+    ) %>%
+    mutate(
+      tooth = "dp3+dp4",
+      
+      B_cusp_span = sqrt((dp3_x_B1 - dp4_x_Bdist)^2 + (dp3_y_B1 - dp4_y_Bdist)^2),
+      L_cusp_span = sqrt((dp3_x_L1 - dp4_x_Ldist)^2 + (dp3_y_L1 - dp4_y_Ldist)^2),
+      mesial_BL_cusp_distance = dp3_mesial_BL,
+      distal_BL_cusp_distance = dp4_distal_BL,
+      
+      diagonal_B1_Ldistal = NA_real_,
+      diagonal_Bdistal_L1 = NA_real_
+    ) %>%
+    select(
+      Specimen, Model, replicate, side, Dentition, tooth,
+      MD_length, BL_length,
+      B_cusp_span, L_cusp_span,
+      mesial_BL_cusp_distance, distal_BL_cusp_distance,
+      diagonal_B1_Ldistal, diagonal_Bdistal_L1
+    )
+}
+
+
+make_perm_premolar_region <- function(data) {
+  
+  data %>%
+    filter(tooth %in% c("P1", "P2")) %>%
+    rename(tooth_id = tooth) %>%
+    group_by(Specimen, Model, replicate, side) %>%
+    filter(all(c("P1", "P2") %in% tooth_id)) %>%
+    summarise(
+      Dentition = "Permanent",
+      
+      MD_length = sum(MD_length, na.rm = TRUE),
+      BL_length = mean(BL_length, na.rm = TRUE),
+      
+      P1_x_B1 = first(x_B1[tooth_id == "P1"]),
+      P1_y_B1 = first(y_B1[tooth_id == "P1"]),
+      P2_x_B1 = first(x_B1[tooth_id == "P2"]),
+      P2_y_B1 = first(y_B1[tooth_id == "P2"]),
+      
+      P1_x_L1 = first(x_L1[tooth_id == "P1"]),
+      P1_y_L1 = first(y_L1[tooth_id == "P1"]),
+      P2_x_L1 = first(x_L1[tooth_id == "P2"]),
+      P2_y_L1 = first(y_L1[tooth_id == "P2"]),
+      
+      .groups = "drop"
+    ) %>%
+    mutate(
+      tooth = "P1+P2",
+      
+      B_cusp_span = sqrt((P1_x_B1 - P2_x_B1)^2 + (P1_y_B1 - P2_y_B1)^2),
+      L_cusp_span = sqrt((P1_x_L1 - P2_x_L1)^2 + (P1_y_L1 - P2_y_L1)^2),
+      mesial_BL_cusp_distance = sqrt((P1_x_B1 - P1_x_L1)^2 + (P1_y_B1 - P1_y_L1)^2),
+      distal_BL_cusp_distance = sqrt((P2_x_B1 - P2_x_L1)^2 + (P2_y_B1 - P2_y_L1)^2),
+      
+      diagonal_B1_Ldistal = NA_real_,
+      diagonal_Bdistal_L1 = NA_real_
+    ) %>%
+    select(
+      Specimen, Model, replicate, side, Dentition, tooth,
+      MD_length, BL_length,
+      B_cusp_span, L_cusp_span,
+      mesial_BL_cusp_distance, distal_BL_cusp_distance,
+      diagonal_B1_Ldistal, diagonal_Bdistal_L1
+    )
+}
+
+decid_premolar_region <- make_decid_premolar_region(df_results)
+perm_premolar_region <- make_perm_premolar_region(df_results)
+df_results_with_region <- bind_rows(
+  df_results,
+  decid_premolar_region,
+  perm_premolar_region
+)
+
+
+pub_table <- df_results_with_region %>%
+  group_by(tooth, Model, side) %>%
+  summarise(
+    MD_length = mean(MD_length, na.rm = TRUE),
+    BL_length = mean(BL_length, na.rm = TRUE),
+    B_cusp_span = mean(B_cusp_span, na.rm = TRUE),
+    L_cusp_span = mean(L_cusp_span, na.rm = TRUE),
+    mesial_BL_cusp_distance = mean(mesial_BL_cusp_distance, na.rm = TRUE),
+    distal_BL_cusp_distance = mean(distal_BL_cusp_distance, na.rm = TRUE),
+    diagonal_B1_Ldistal = mean(diagonal_B1_Ldistal, na.rm = TRUE),
+    diagonal_Bdistal_L1 = mean(diagonal_Bdistal_L1, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(tooth, Model, side) %>%
+  mutate(across(where(is.numeric), ~round(.x, 3)))
+
+# ---------------------------
+# Radius of Curvature and Subtended Angle----
+# Exact mesh-plane intersection version
+# Outer-flank subtended angle version
+# ---------------------------
+
+# ---------------------------
+# Load mesh and extract vertices/faces
+# ---------------------------
+
+mesh_upper <- vcgImport(upper_mesh_file)
+mesh_lower <- vcgImport(lower_mesh_file)
+
+mesh_upper_points <- as.data.frame(t(mesh_upper$vb[1:3, ]))
+mesh_lower_points <- as.data.frame(t(mesh_lower$vb[1:3, ]))
+
+colnames(mesh_upper_points) <- c("x", "y", "z")
+colnames(mesh_lower_points) <- c("x", "y", "z")
+
+mesh_upper_faces <- as.data.frame(t(mesh_upper$it[1:3, ]))
+mesh_lower_faces <- as.data.frame(t(mesh_lower$it[1:3, ]))
+
+colnames(mesh_upper_faces) <- c("v1", "v2", "v3")
+colnames(mesh_lower_faces) <- c("v1", "v2", "v3")
+
+mesh_points_list <- list(
+  Upper = mesh_upper_points,
+  Lower = mesh_lower_points
+)
+
+mesh_faces_list <- list(
+  Upper = mesh_upper_faces,
+  Lower = mesh_lower_faces
+)
+
+# ---------------------------
+# Helper functions
+# ---------------------------
+
+cross_prod <- function(a, b) {
+  c(
+    a[2]*b[3] - a[3]*b[2],
+    a[3]*b[1] - a[1]*b[3],
+    a[1]*b[2] - a[2]*b[1]
+  )
+}
+
+calc_RoC_from_fit <- function(fit) {
+  coefs <- coef(fit)
+  first_deriv <- unname(coefs[2])
+  second_deriv <- unname(2 * coefs[3])
+  
+  if (!is.finite(second_deriv) || second_deriv == 0) {
+    return(NA_real_)
+  }
+  
+  ((1 + first_deriv^2)^(3/2)) / abs(second_deriv)
+}
+
+calc_outer_point_angle <- function(profile,
+                                   angle_cutoff = 0.60,
+                                   n_outer_points = 5) {
+  
+  if (nrow(profile) < (2 * n_outer_points)) {
+    return(NA_real_)
+  }
+  
+  x_limit <- angle_cutoff * max(abs(profile$position), na.rm = TRUE)
+  
+  angle_profile <- profile %>%
+    filter(abs(position) <= x_limit)
+  
+  left_side <- angle_profile %>%
+    filter(position < 0) %>%
+    arrange(position)
+  
+  right_side <- angle_profile %>%
+    filter(position > 0) %>%
+    arrange(position)
+  
+  if (nrow(left_side) < n_outer_points || nrow(right_side) < n_outer_points) {
+    return(NA_real_)
+  }
+  
+  # Outermost points within the angle window
+  left_fit_points <- left_side %>%
+    slice_head(n = n_outer_points)
+  
+  right_fit_points <- right_side %>%
+    slice_tail(n = n_outer_points)
+  
+  left_fit <- lm(height ~ position, data = left_fit_points)
+  right_fit <- lm(height ~ position, data = right_fit_points)
+  
+  m_left <- coef(left_fit)[["position"]]
+  c_left <- coef(left_fit)[["(Intercept)"]]
+  
+  m_right <- coef(right_fit)[["position"]]
+  c_right <- coef(right_fit)[["(Intercept)"]]
+  
+  if (!is.finite(m_left) || !is.finite(m_right) ||
+      !is.finite(c_left) || !is.finite(c_right) ||
+      m_left == m_right) {
+    return(NA_real_)
+  }
+  
+  x_intersect <- (c_right - c_left) / (m_left - m_right)
+  y_intersect <- m_left * x_intersect + c_left
+  
+  x_left_end <- min(left_fit_points$position, na.rm = TRUE)
+  y_left_end <- m_left * x_left_end + c_left
+  
+  x_right_end <- max(right_fit_points$position, na.rm = TRUE)
+  y_right_end <- m_right * x_right_end + c_right
+  
+  v_left <- c(x_left_end - x_intersect, y_left_end - y_intersect)
+  v_right <- c(x_right_end - x_intersect, y_right_end - y_intersect)
+  
+  cos_theta <- sum(v_left * v_right) /
+    (sqrt(sum(v_left^2)) * sqrt(sum(v_right^2)))
+  
+  cos_theta <- max(min(cos_theta, 1), -1)
+  
+  acos(cos_theta) * 180 / pi
+}
+
+make_outer_point_angle_lines <- function(profile,
+                                         angle_cutoff = 0.60,
+                                         n_outer_points = 5) {
+  
+  if (nrow(profile) < (2 * n_outer_points)) {
+    return(data.frame())
+  }
+  
+  x_limit <- angle_cutoff * max(abs(profile$position), na.rm = TRUE)
+  
+  angle_profile <- profile %>%
+    filter(abs(position) <= x_limit)
+  
+  left_side <- angle_profile %>%
+    filter(position < 0) %>%
+    arrange(position)
+  
+  right_side <- angle_profile %>%
+    filter(position > 0) %>%
+    arrange(position)
+  
+  if (nrow(left_side) < n_outer_points || nrow(right_side) < n_outer_points) {
+    return(data.frame())
+  }
+  
+  left_fit_points <- left_side %>%
+    slice_head(n = n_outer_points)
+  
+  right_fit_points <- right_side %>%
+    slice_tail(n = n_outer_points)
+  
+  left_fit <- lm(height ~ position, data = left_fit_points)
+  right_fit <- lm(height ~ position, data = right_fit_points)
+  
+  m_left <- coef(left_fit)[["position"]]
+  c_left <- coef(left_fit)[["(Intercept)"]]
+  
+  m_right <- coef(right_fit)[["position"]]
+  c_right <- coef(right_fit)[["(Intercept)"]]
+  
+  if (!is.finite(m_left) || !is.finite(m_right) ||
+      !is.finite(c_left) || !is.finite(c_right) ||
+      m_left == m_right) {
+    return(data.frame())
+  }
+  
+  x_intersect <- (c_right - c_left) / (m_left - m_right)
+  y_intersect <- m_left * x_intersect + c_left
+  
+  x_left_end <- min(left_fit_points$position, na.rm = TRUE)
+  y_left_end <- m_left * x_left_end + c_left
+  
+  x_right_end <- max(right_fit_points$position, na.rm = TRUE)
+  y_right_end <- m_right * x_right_end + c_right
+  
+  data.frame(
+    x = c(x_intersect, x_left_end, x_intersect, x_right_end),
+    y = c(y_intersect, y_left_end, y_intersect, y_right_end),
+    side_line = c("left", "left", "right", "right")
+  )
+}
+
+intersect_triangle_plane <- function(tri, plane_point, plane_normal) {
+  
+  edges <- list(c(1, 2), c(2, 3), c(3, 1))
+  pts <- list()
+  
+  for (edge in edges) {
+    
+    p1 <- as.numeric(tri[edge[1], c("x", "y", "z")])
+    p2 <- as.numeric(tri[edge[2], c("x", "y", "z")])
+    
+    d1 <- sum((p1 - plane_point) * plane_normal)
+    d2 <- sum((p2 - plane_point) * plane_normal)
+    
+    if (!is.finite(d1) || !is.finite(d2)) next
+    if (d1 == 0 && d2 == 0) next
+    
+    if (d1 * d2 <= 0 && d1 != d2) {
+      t <- d1 / (d1 - d2)
+      
+      if (t >= 0 && t <= 1) {
+        p <- p1 + t * (p2 - p1)
+        
+        pts[[length(pts) + 1]] <- data.frame(
+          x = p[1],
+          y = p[2],
+          z = p[3]
+        )
+      }
+    }
+  }
+  
+  if (length(pts) < 2) return(NULL)
+  
+  pts <- bind_rows(pts) %>%
+    mutate(across(everything(), ~round(.x, 6))) %>%
+    distinct()
+  
+  if (nrow(pts) < 2) return(NULL)
+  
+  pts
+}
+
+extract_exact_cusp_slice <- function(apex,
+                                     axis_unit,
+                                     plane_normal,
+                                     mesh_points,
+                                     mesh_faces,
+                                     Model,
+                                     ROI_radius) {
+  
+  z1 <- as.matrix(mesh_points[mesh_faces$v1, c("x", "y", "z")])
+  z2 <- as.matrix(mesh_points[mesh_faces$v2, c("x", "y", "z")])
+  z3 <- as.matrix(mesh_points[mesh_faces$v3, c("x", "y", "z")])
+  
+  d1 <- rowSums(sweep(z1, 2, apex) * matrix(plane_normal, nrow(z1), 3, byrow = TRUE))
+  d2 <- rowSums(sweep(z2, 2, apex) * matrix(plane_normal, nrow(z2), 3, byrow = TRUE))
+  d3 <- rowSums(sweep(z3, 2, apex) * matrix(plane_normal, nrow(z3), 3, byrow = TRUE))
+  
+  crosses <- apply(cbind(d1, d2, d3), 1, function(d) {
+    min(d, na.rm = TRUE) <= 0 && max(d, na.rm = TRUE) >= 0
+  })
+  
+  crossing_faces <- mesh_faces[crosses, , drop = FALSE]
+  
+  if (nrow(crossing_faces) < 3) return(data.frame())
+  
+  intersection_points <- list()
+  
+  for (i in seq_len(nrow(crossing_faces))) {
+    
+    face <- crossing_faces[i, ]
+    
+    tri <- mesh_points[
+      c(face$v1, face$v2, face$v3),
+      c("x", "y", "z"),
+      drop = FALSE
+    ]
+    
+    pts <- intersect_triangle_plane(
+      tri = tri,
+      plane_point = apex,
+      plane_normal = plane_normal
+    )
+    
+    if (!is.null(pts)) {
+      intersection_points[[length(intersection_points) + 1]] <- pts
+    }
+  }
+  
+  if (length(intersection_points) == 0) return(data.frame())
+  
+  slice_points <- bind_rows(intersection_points) %>%
+    distinct()
+  
+  V_slice <- sweep(as.matrix(slice_points[, c("x", "y", "z")]), 2, apex)
+  dist_to_apex <- sqrt(rowSums(V_slice^2))
+  
+  keep <- dist_to_apex < ROI_radius
+  
+  slice_points <- slice_points[keep, , drop = FALSE]
+  V_slice <- V_slice[keep, , drop = FALSE]
+  
+  if (nrow(slice_points) < 3) return(data.frame())
+  
+  height_raw <- V_slice[, 3]
+  
+  height <- if (Model == "Lower") {
+    -height_raw
+  } else {
+    height_raw
+  }
+  
+  data.frame(
+    position = as.numeric(V_slice %*% axis_unit),
+    height = height
+  ) %>%
+    filter(is.finite(position), is.finite(height)) %>%
+    arrange(position)
+}
+
+# ---------------------------
+# Main function: calculate RoC and subtended angle
+# ---------------------------
+
+calc_cusp_roc <- function(apex, MD_unit_x, MD_unit_y,
+                          MD_length, BL_length,
+                          mesh_points,
+                          mesh_faces,
+                          Model,
+                          cap_scale = 0.15,
+                          roc_cutoff = 0.60,
+                          angle_cutoff = 0.60,
+                          n_outer_points = 5) {
+  
+  if (any(!is.finite(c(apex, MD_unit_x, MD_unit_y, MD_length, BL_length)))) {
+    return(data.frame(
+      MD_RoC = NA_real_,
+      BL_RoC = NA_real_,
+      MD_angle = NA_real_,
+      BL_angle = NA_real_,
+      MD_r2 = NA_real_,
+      BL_r2 = NA_real_,
+      n_MD_points = NA_real_,
+      n_BL_points = NA_real_
+    ))
+  }
+  
+  MD_unit <- c(MD_unit_x, MD_unit_y, 0)
+  MD_unit <- MD_unit / sqrt(sum(MD_unit^2))
+  
+  BL_unit <- c(-MD_unit_y, MD_unit_x, 0)
+  BL_unit <- BL_unit / sqrt(sum(BL_unit^2))
+  
+  Z_unit <- c(0, 0, 1)
+  
+  ROI_radius <- cap_scale * mean(c(MD_length, BL_length), na.rm = TRUE)
+  
+  normal_MD <- cross_prod(MD_unit, Z_unit)
+  normal_BL <- cross_prod(BL_unit, Z_unit)
+  
+  normal_MD <- normal_MD / sqrt(sum(normal_MD^2))
+  normal_BL <- normal_BL / sqrt(sum(normal_BL^2))
+  
+  MD_slice <- extract_exact_cusp_slice(
+    apex = apex,
+    axis_unit = MD_unit,
+    plane_normal = normal_MD,
+    mesh_points = mesh_points,
+    mesh_faces = mesh_faces,
+    Model = Model,
+    ROI_radius = ROI_radius
+  )
+  
+  BL_slice <- extract_exact_cusp_slice(
+    apex = apex,
+    axis_unit = BL_unit,
+    plane_normal = normal_BL,
+    mesh_points = mesh_points,
+    mesh_faces = mesh_faces,
+    Model = Model,
+    ROI_radius = ROI_radius
+  )
+  
+  fit_radius_angle <- function(profile) {
+    
+    if (nrow(profile) < 6) {
+      return(c(
+        radius = NA_real_,
+        angle = NA_real_,
+        r2 = NA_real_,
+        n_points = nrow(profile)
+      ))
+    }
+    
+    x_limit_roc <- roc_cutoff * max(abs(profile$position), na.rm = TRUE)
+    
+    roc_profile <- profile %>%
+      filter(abs(position) <= x_limit_roc)
+    
+    if (nrow(roc_profile) < 6) {
+      return(c(
+        radius = NA_real_,
+        angle = NA_real_,
+        r2 = NA_real_,
+        n_points = nrow(roc_profile)
+      ))
+    }
+    
+    fit <- lm(height ~ poly(position, 3, raw = TRUE), data = roc_profile)
+    
+    radius <- calc_RoC_from_fit(fit)
+    
+    angle_deg <- calc_outer_point_angle(
+      profile,
+      angle_cutoff = angle_cutoff,
+      n_outer_points = n_outer_points
+    )
+    
+    c(
+      radius = unname(radius),
+      angle = unname(angle_deg),
+      r2 = unname(summary(fit)$r.squared),
+      n_points = unname(nrow(roc_profile))
+    )
+  }
+  
+  MD_result <- fit_radius_angle(MD_slice)
+  BL_result <- fit_radius_angle(BL_slice)
+  
+  data.frame(
+    MD_RoC = unname(MD_result["radius"]),
+    BL_RoC = unname(BL_result["radius"]),
+    MD_angle = unname(MD_result["angle"]),
+    BL_angle = unname(BL_result["angle"]),
+    MD_r2 = unname(MD_result["r2"]),
+    BL_r2 = unname(BL_result["r2"]),
+    n_MD_points = unname(MD_result["n_points"]),
+    n_BL_points = unname(BL_result["n_points"])
+  )
+}
+
+# ---------------------------
+# Identify cusp apex landmarks
+# ---------------------------
+
+cusp_landmarks <- c("b1", "b2", "b3", "l1", "l2", "l3")
+
+# ---------------------------
+# Create apex dataset and attach tooth-level MD/BL data
+# ---------------------------
+
+apex_data <- data %>%
+  mutate(landmark_clean = tolower(trimws(landmark))) %>%
+  filter(landmark_clean %in% cusp_landmarks) %>%
+  rename(
+    cusp = landmark_clean,
+    apex_x = x,
+    apex_y = y,
+    apex_z = z
+  ) %>%
+  left_join(
+    df_results %>%
+      select(
+        Specimen, Model, replicate, side, tooth,
+        MD_unit_x, MD_unit_y,
+        MD_length, BL_length
+      ),
+    by = c("Specimen", "Model", "replicate", "side", "tooth")
+  )
+
+# ---------------------------
+# Calculate RoC and angle for each cusp
+# ---------------------------
+
+roc_results <- apex_data %>%
+  rowwise() %>%
+  mutate(
+    roc = list(
+      calc_cusp_roc(
+        apex = c(apex_x, apex_y, apex_z),
+        MD_unit_x = MD_unit_x,
+        MD_unit_y = MD_unit_y,
+        MD_length = MD_length,
+        BL_length = BL_length,
+        mesh_points = mesh_points_list[[as.character(Model)]],
+        mesh_faces = mesh_faces_list[[as.character(Model)]],
+        Model = Model,
+        cap_scale = CAP_SCALE,
+        roc_cutoff = ROC_CUTOFF,
+        angle_cutoff = ANGLE_CUTOFF,
+        n_outer_points = N_OUTER_POINTS
+      )
+    )
+  ) %>%
+  unnest(roc) %>%
+  ungroup()
+# ---------------------------
+# Summarise by tooth, side, and cusp
+# ---------------------------
+
+# ---------------------------
+# Add angle QC flags and summarise by tooth, side, and cusp
+# ---------------------------
+
+roc_results <- roc_results %>%
+  mutate(
+    MD_angle_flag = case_when(
+      is.na(MD_angle) ~ "missing",
+      MD_angle < 30 ~ "too small",
+      MD_angle > 170 ~ "too large",
+      MD_r2 < 0.85 ~ "poor RoC fit",
+      TRUE ~ "likely ok"
+    ),
+    BL_angle_flag = case_when(
+      is.na(BL_angle) ~ "missing",
+      BL_angle < 30 ~ "too small",
+      BL_angle > 170 ~ "too large",
+      BL_r2 < 0.85 ~ "poor RoC fit",
+      TRUE ~ "likely ok"
+    )
+  )
+mean_or_na <- function(x) {
+  if (all(is.na(x))) NA_real_ else mean(x, na.rm = TRUE)
+}
+
+flag_summary <- function(x) {
+  x <- na.omit(x)
+  if (length(x) == 0) return(NA_character_)
+  paste(unique(x), collapse = "; ")
+}
+
+roc_summary <- roc_results %>%
+  group_by(Model, tooth, side, cusp) %>%
+  summarise(
+    MD_RoC = mean_or_na(MD_RoC),
+    BL_RoC = mean_or_na(BL_RoC),
+    MD_angle = mean_or_na(MD_angle),
+    BL_angle = mean_or_na(BL_angle),
+    MD_angle_flag = flag_summary(MD_angle_flag),
+    BL_angle_flag = flag_summary(BL_angle_flag),
+    mean_MD_r2 = mean_or_na(MD_r2),
+    mean_BL_r2 = mean_or_na(BL_r2),
+    mean_n_MD_points = mean_or_na(n_MD_points),
+    mean_n_BL_points = mean_or_na(n_BL_points),
+    n = n(),
+    .groups = "drop"
+  )
+# ---------------------------
+# Plot polynomial fits for selected cusps
+# ---------------------------
+
+extract_cusp_profile <- function(apex, MD_unit_x, MD_unit_y,
+                                 MD_length, BL_length,
+                                 mesh_points,
+                                 mesh_faces,
+                                 Model,
+                                 orientation = "MD",
+                                 cap_scale = 0.15,
+                                 roc_cutoff = 0.60) {
+  
+  MD_unit <- c(MD_unit_x, MD_unit_y, 0)
+  MD_unit <- MD_unit / sqrt(sum(MD_unit^2))
+  
+  BL_unit <- c(-MD_unit_y, MD_unit_x, 0)
+  BL_unit <- BL_unit / sqrt(sum(BL_unit^2))
+  
+  Z_unit <- c(0, 0, 1)
+  
+  axis_unit <- if (orientation == "MD") MD_unit else BL_unit
+  
+  normal <- if (orientation == "MD") {
+    cross_prod(MD_unit, Z_unit)
+  } else {
+    cross_prod(BL_unit, Z_unit)
+  }
+  
+  normal <- normal / sqrt(sum(normal^2))
+  
+  ROI_radius <- cap_scale * mean(c(MD_length, BL_length), na.rm = TRUE)
+  
+  profile <- extract_exact_cusp_slice(
+    apex = apex,
+    axis_unit = axis_unit,
+    plane_normal = normal,
+    mesh_points = mesh_points,
+    mesh_faces = mesh_faces,
+    Model = Model,
+    ROI_radius = ROI_radius
+  )
+  
+  if (nrow(profile) < 6) {
+    return(list(
+      profile = profile,
+      roc_profile = profile,
+      fit = NULL
+    ))
+  }
+  
+  x_limit_roc <- roc_cutoff * max(abs(profile$position), na.rm = TRUE)
+  
+  roc_profile <- profile %>%
+    filter(abs(position) <= x_limit_roc)
+  
+  if (nrow(roc_profile) < 6) {
+    return(list(
+      profile = profile,
+      roc_profile = roc_profile,
+      fit = NULL
+    ))
+  }
+  
+  fit <- lm(height ~ poly(position, 3, raw = TRUE), data = roc_profile)
+  
+  list(
+    profile = profile,
+    roc_profile = roc_profile,
+    fit = fit
+  )
+}
+
+plot_cusp_profile <- function(profile, roc_profile, fit, tooth, Model, side, cusp, orientation,
+                              MD_length, BL_length, cap_scale = 0.15) {
+  
+  if (is.null(fit) || nrow(roc_profile) < 6) {
+    return(
+      ggplot(profile, aes(x = position, y = height)) +
+        geom_point(alpha = 0.4, size = 1.8) +
+        theme_classic() +
+        labs(
+          title = paste(tooth, Model, side, cusp, orientation, "cross-section"),
+          subtitle = "Too few points for polynomial fit",
+          x = paste("Position along", orientation, "axis"),
+          y = "Height relative to apex"
+        )
+    )
+  }
+  
+  x_seq <- seq(
+    min(roc_profile$position, na.rm = TRUE),
+    max(roc_profile$position, na.rm = TRUE),
+    length.out = 100
+  )
+  
+  fit_curve <- data.frame(
+    position = x_seq,
+    height = predict(fit, newdata = data.frame(position = x_seq))
+  )
+  
+  r2 <- summary(fit)$r.squared
+  ROI_radius <- cap_scale * mean(c(MD_length, BL_length), na.rm = TRUE)
+  n_points <- nrow(roc_profile)
+  RoC <- calc_RoC_from_fit(fit)
+  
+  ggplot(profile, aes(x = position, y = height)) +
+    geom_point(alpha = 0.25, size = 1.8) +
+    geom_point(
+      data = roc_profile,
+      aes(x = position, y = height),
+      size = 2.3
+    ) +
+    geom_line(
+      data = fit_curve,
+      aes(x = position, y = height),
+      linewidth = 1
+    ) +
+    geom_point(
+      data = data.frame(position = 0, height = 0),
+      aes(x = position, y = height),
+      size = 3
+    ) +
+    labs(
+      title = paste(tooth, Model, side, cusp, orientation, "cross-section"),
+      subtitle = paste0(
+        "RoC = ", round(RoC, 3),
+        "; R² = ", round(r2, 3),
+        "; ROI = ", round(ROI_radius, 3),
+        "; n = ", n_points
+      ),
+      x = paste("Position along", orientation, "axis"),
+      y = "Height relative to apex"
+    ) +
+    theme_classic()
+}
+
+# ---------------------------
+# Plot subtended angle for selected cusps
+# ---------------------------
+
+plot_subtended_angle <- function(profile, tooth, Model, side, cusp, orientation,
+                                 angle_cutoff = 0.60,
+                                 n_outer_points = 5) {
+  
+  angle_deg <- calc_outer_point_angle(
+    profile,
+    angle_cutoff = angle_cutoff,
+    n_outer_points = n_outer_points
+  )
+  
+  line_df <- make_outer_point_angle_lines(
+    profile,
+    angle_cutoff = angle_cutoff,
+    n_outer_points = n_outer_points
+  )
+  
+  x_limit <- angle_cutoff * max(abs(profile$position), na.rm = TRUE)
+  
+  angle_profile <- profile %>%
+    filter(abs(position) <= x_limit)
+  
+  left_side <- angle_profile %>%
+    filter(position < 0) %>%
+    arrange(position)
+  
+  right_side <- angle_profile %>%
+    filter(position > 0) %>%
+    arrange(position)
+  
+  left_fit_points <- if (nrow(left_side) >= n_outer_points) {
+    left_side %>% slice_head(n = n_outer_points)
+  } else {
+    data.frame()
+  }
+  
+  right_fit_points <- if (nrow(right_side) >= n_outer_points) {
+    right_side %>% slice_tail(n = n_outer_points)
+  } else {
+    data.frame()
+  }
+  
+  if (is.na(angle_deg) || nrow(line_df) == 0) {
+    return(
+      ggplot(profile, aes(x = position, y = height)) +
+        geom_point(alpha = 0.35, size = 1.8) +
+        geom_point(
+          data = data.frame(position = 0, height = 0),
+          aes(x = position, y = height),
+          size = 3
+        ) +
+        theme_classic() +
+        labs(
+          title = paste(tooth, Model, side, cusp, orientation, "subtended angle"),
+          subtitle = "Too few points to calculate outer-flank angle",
+          x = paste("Position along", orientation, "axis"),
+          y = "Height relative to apex"
+        )
+    )
+  }
+  
+  ggplot(profile, aes(x = position, y = height)) +
+    geom_point(alpha = 0.20, size = 1.8) +
+    geom_point(
+      data = angle_profile,
+      aes(x = position, y = height),
+      alpha = 0.35,
+      size = 1.8
+    ) +
+    geom_point(
+      data = left_fit_points,
+      aes(x = position, y = height),
+      size = 2.5
+    ) +
+    geom_point(
+      data = right_fit_points,
+      aes(x = position, y = height),
+      size = 2.5
+    ) +
+    geom_line(
+      data = line_df,
+      aes(x = x, y = y, group = side_line),
+      linewidth = 1.1
+    ) +
+    geom_point(
+      data = data.frame(position = 0, height = 0),
+      aes(x = position, y = height),
+      shape = 4,
+      size = 3
+    ) +
+    labs(
+      title = paste(tooth, Model, side, cusp, orientation, "subtended angle"),
+      subtitle = paste0(
+        "Outer ", n_outer_points,
+        " points per side within ",
+        angle_cutoff * 100,
+        "% profile window; theta = ",
+        round(angle_deg, 1), "°"
+      ),
+      x = paste("Position along", orientation, "axis"),
+      y = "Height relative to apex"
+    ) +
+    theme_classic()
+}
+
+# ---------------------------
+# Subtended angle QC and plot inspection
+# Skip missing angles
+# Plot too small, too large, and likely ok
+# ---------------------------
+
+angle_qc <- roc_results %>%
+  mutate(
+    MD_angle_flag = case_when(
+      is.na(MD_angle) ~ "missing",
+      MD_angle < 30 ~ "too small",
+      MD_angle > 170 ~ "too large",
+      MD_r2 < 0.85 ~ "poor RoC fit",
+      TRUE ~ "likely ok"
+    ),
+    BL_angle_flag = case_when(
+      is.na(BL_angle) ~ "missing",
+      BL_angle < 30 ~ "too small",
+      BL_angle > 170 ~ "too large",
+      BL_r2 < 0.85 ~ "poor RoC fit",
+      TRUE ~ "likely ok"
+    )
+  )
+angle_qc %>% count(MD_angle_flag)
+angle_qc %>% count(BL_angle_flag)
+
+# Choose which flags to plot
+flags_to_plot <- c("too small", "too large")
+
+angles_to_plot <- angle_qc %>%
+  filter(
+    MD_angle_flag %in% flags_to_plot |
+      BL_angle_flag %in% flags_to_plot
+  ) %>%
+  select(
+    Specimen, Model, replicate, side, tooth, cusp,
+    MD_angle, MD_angle_flag,
+    BL_angle, BL_angle_flag
+  )
+# ---------------------------
+# Incisor Cross-Sectional Area Calculations----
+# True mesh-plane intersection version
+# ---------------------------
+
+# ---------------------------
+# Extract mesh vertices and faces
+# ---------------------------
+
+# ---------------------------
+# Extract mesh vertices and faces for upper and lower models
+# ---------------------------
+
+mesh_upper_points <- as.data.frame(t(mesh_upper$vb[1:3, ]))
+colnames(mesh_upper_points) <- c("x", "y", "z")
+
+mesh_lower_points <- as.data.frame(t(mesh_lower$vb[1:3, ]))
+colnames(mesh_lower_points) <- c("x", "y", "z")
+
+mesh_upper_faces <- as.data.frame(t(mesh_upper$it[1:3, ]))
+colnames(mesh_upper_faces) <- c("v1", "v2", "v3")
+
+mesh_lower_faces <- as.data.frame(t(mesh_lower$it[1:3, ]))
+colnames(mesh_lower_faces) <- c("v1", "v2", "v3")
+
+mesh_points_list <- list(
+  Upper = mesh_upper_points,
+  Lower = mesh_lower_points
+)
+
+mesh_faces_list <- list(
+  Upper = mesh_upper_faces,
+  Lower = mesh_lower_faces
+)
+
+# ---------------------------
+# Helper: polygon area
+# ---------------------------
+
+polygon_area <- function(x, y) {
+  n <- length(x)
+  0.5 * abs(sum(x * y[c(2:n, 1)] - y * x[c(2:n, 1)]))
+}
+
+# ---------------------------
+# Helper: intersect one triangle with horizontal z-plane
+# ---------------------------
+
+intersect_triangle_z <- function(tri, section_z) {
+  
+  edges <- list(c(1, 2), c(2, 3), c(3, 1))
+  pts <- list()
+  
+  for (edge in edges) {
+    
+    p1 <- as.numeric(tri[edge[1], c("x", "y", "z")])
+    p2 <- as.numeric(tri[edge[2], c("x", "y", "z")])
+    
+    z1 <- p1[3]
+    z2 <- p2[3]
+    
+    if (!is.finite(z1) || !is.finite(z2) || !is.finite(section_z)) {
+      next
+    }
+    
+    if (z1 == section_z && z2 == section_z) next
+    
+    if ((z1 - section_z) * (z2 - section_z) <= 0 && z1 != z2) {
+      
+      t <- (section_z - z1) / (z2 - z1)
+      
+      if (t >= 0 && t <= 1) {
+        p <- p1 + t * (p2 - p1)
+        
+        pts[[length(pts) + 1]] <- data.frame(
+          x = p[1],
+          y = p[2],
+          z = section_z
+        )
+      }
+    }
+  }
+  
+  if (length(pts) < 2) return(NULL)
+  
+  pts <- bind_rows(pts) %>%
+    distinct()
+  
+  if (nrow(pts) < 2) return(NULL)
+  
+  pts
+}
+
+# ---------------------------
+# Extract projected 2D CSA points
+# ---------------------------
+
+extract_incisor_intersection_2d <- function(apex,
+                                            gumline,
+                                            mesial,
+                                            distal,
+                                            buccal,
+                                            lingual,
+                                            MD_unit,
+                                            BL_unit,
+                                            MD_length,
+                                            BL_length,
+                                            mesh_points,
+                                            mesh_faces,
+                                            Model,
+                                            section_scale = 0.80,
+                                            bbox_buffer = 0.10) {
+  
+  MD_unit <- as.numeric(MD_unit)
+  BL_unit <- as.numeric(BL_unit)
+  
+  tooth_centre <- colMeans(rbind(
+    mesial[1:2],
+    distal[1:2],
+    buccal[1:2],
+    lingual[1:2]
+  ))
+  
+  half_MD <- (MD_length / 2) * (1 + bbox_buffer)
+  half_BL <- (BL_length / 2) * (1 + bbox_buffer)
+  
+  section_z <- gumline[3] + section_scale * (apex[3] - gumline[3])
+  
+  z1 <- mesh_points$z[mesh_faces$v1]
+  z2 <- mesh_points$z[mesh_faces$v2]
+  z3 <- mesh_points$z[mesh_faces$v3]
+  
+  crosses <- apply(
+    cbind(z1, z2, z3),
+    1,
+    function(z) min(z, na.rm = TRUE) <= section_z &&
+      max(z, na.rm = TRUE) >= section_z
+  )
+  
+  crossing_faces <- mesh_faces[crosses, , drop = FALSE]
+  
+  if (nrow(crossing_faces) < 3) {
+    return(list(
+      section_2d = data.frame(),
+      section_z = section_z,
+      reason = "too few crossing faces"
+    ))
+  }
+  
+  intersection_points <- list()
+  
+  for (i in seq_len(nrow(crossing_faces))) {
+    
+    face <- crossing_faces[i, ]
+    
+    tri <- mesh_points[
+      c(face$v1, face$v2, face$v3),
+      c("x", "y", "z"),
+      drop = FALSE
+    ]
+    
+    pts <- intersect_triangle_z(tri, section_z)
+    
+    if (!is.null(pts)) {
+      intersection_points[[length(intersection_points) + 1]] <- pts
+    }
+  }
+  
+  if (length(intersection_points) == 0) {
+    return(list(
+      section_2d = data.frame(),
+      section_z = section_z,
+      reason = "no intersection points"
+    ))
+  }
+  
+  intersection_points <- bind_rows(intersection_points) %>%
+    mutate(
+      x = round(x, 6),
+      y = round(y, 6),
+      z = round(z, 6)
+    ) %>%
+    distinct()
+  
+  section_xy <- intersection_points[, c("x", "y"), drop = FALSE]
+  section_local <- sweep(section_xy, 2, tooth_centre)
+  
+  section_2d <- data.frame(
+    MD = as.numeric(as.matrix(section_local) %*% MD_unit),
+    BL = as.numeric(as.matrix(section_local) %*% BL_unit)
+  )
+  
+  section_2d <- section_2d %>%
+    filter(
+      abs(MD) <= half_MD,
+      abs(BL) <= half_BL
+    )
+  
+  if (nrow(section_2d) < 3) {
+    return(list(
+      section_2d = section_2d,
+      section_z = section_z,
+      reason = "too few bounded intersection points"
+    ))
+  }
+  
+  cx <- mean(section_2d$MD)
+  cy <- mean(section_2d$BL)
+  
+  section_2d <- section_2d %>%
+    mutate(angle = atan2(BL - cy, MD - cx)) %>%
+    arrange(angle)
+  
+  list(
+    section_2d = section_2d,
+    section_z = section_z,
+    reason = "success"
+  )
+}
+
+# ---------------------------
+# CSA function
+# ---------------------------
+
+calc_incisor_csa_intersection <- function(apex,
+                                          gumline,
+                                          mesial,
+                                          distal,
+                                          buccal,
+                                          lingual,
+                                          MD_unit,
+                                          BL_unit,
+                                          MD_length,
+                                          BL_length,
+                                          mesh_points,
+                                          mesh_faces,
+                                          Model,
+                                          section_scale = 0.80,
+                                          bbox_buffer = 0.10) {
+  
+  required_values <- c(
+    apex, gumline, mesial, distal, buccal, lingual,
+    MD_unit, BL_unit, MD_length, BL_length
+  )
+  
+  if (any(is.na(required_values)) || any(!is.finite(required_values))) {
+    return(data.frame(
+      CSA = NA_real_,
+      n_points = NA_real_,
+      section_z = NA_real_,
+      section_scale = section_scale,
+      bbox_buffer = bbox_buffer,
+      reason = "missing required incisor landmark"
+    ))
+  }
+  
+  extracted <- extract_incisor_intersection_2d(
+    apex = apex,
+    gumline = gumline,
+    mesial = mesial,
+    distal = distal,
+    buccal = buccal,
+    lingual = lingual,
+    MD_unit = MD_unit,
+    BL_unit = BL_unit,
+    MD_length = MD_length,
+    BL_length = BL_length,
+    mesh_points = mesh_points,
+    mesh_faces = mesh_faces,
+    Model = Model,
+    section_scale = section_scale,
+    bbox_buffer = bbox_buffer
+  )
+  
+  section_2d <- extracted$section_2d
+  
+  if (nrow(section_2d) < 3 || extracted$reason != "success") {
+    return(data.frame(
+      CSA = NA_real_,
+      n_points = nrow(section_2d),
+      section_z = extracted$section_z,
+      section_scale = section_scale,
+      bbox_buffer = bbox_buffer,
+      reason = extracted$reason
+    ))
+  }
+  
+  CSA <- polygon_area(section_2d$MD, section_2d$BL)
+  
+  data.frame(
+    CSA = CSA,
+    n_points = nrow(section_2d),
+    section_z = extracted$section_z,
+    section_scale = section_scale,
+    bbox_buffer = bbox_buffer,
+    reason = "success"
+  )
+}
+
+# ---------------------------
+# Calculate CSA for incisors
+# ---------------------------
+
+incisor_teeth <- c("i1", "i2", "I1", "I2")
+
+csa_results <- df_results %>%
+  filter(tooth %in% incisor_teeth) %>%
+  rowwise() %>%
+  mutate(
+    csa = list(
+      calc_incisor_csa_intersection(
+        apex = c(x_apex, y_apex, z_apex),
+        gumline = c(x_gumline, y_gumline, z_gumline),
+        mesial = c(x_mesial, y_mesial, z_mesial),
+        distal = c(x_distal, y_distal, z_distal),
+        buccal = c(x_buccal, y_buccal, z_buccal),
+        lingual = c(x_lingual, y_lingual, z_lingual),
+        MD_unit = c(MD_unit_x, MD_unit_y),
+        BL_unit = c(BL_x, BL_y),
+        MD_length = MD_length,
+        BL_length = BL_length,
+        mesh_points = mesh_points_list[[as.character(Model)]],
+        mesh_faces = mesh_faces_list[[as.character(Model)]],
+        Model = Model,
+        section_scale = CSA_SECTION_SCALE,
+        bbox_buffer = CSA_BBOX_BUFFER
+      )
+    )
+  ) %>%
+  unnest(csa) %>%
+  ungroup()
+csa_results %>%
+  count(Model, reason)
+
+# ---------------------------
+# Summary table
+# ---------------------------
+
+csa_summary <- csa_results %>%
+  group_by(Model, tooth, side) %>%
+  summarise(
+    CSA = mean(CSA, na.rm = TRUE),
+    mean_n_points = mean(n_points, na.rm = TRUE),
+    section_z = mean(section_z, na.rm = TRUE),
+    MD_length = mean(MD_length, na.rm = TRUE),
+    BL_length = mean(BL_length, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(across(where(is.numeric), ~round(.x, 3)))
+# ---------------------------
+# Plot true mesh-plane cross-sections
+# ---------------------------
+
+
+plot_incisor_csa_intersection <- function(tooth_row,
+                                          mesh_points,
+                                          mesh_faces,
+                                          section_scale = 0.80,
+                                          bbox_buffer = 0.10) {
+  
+  required_values <- c(
+    tooth_row$x_apex, tooth_row$y_apex, tooth_row$z_apex,
+    tooth_row$x_gumline, tooth_row$y_gumline, tooth_row$z_gumline,
+    tooth_row$x_mesial, tooth_row$y_mesial, tooth_row$z_mesial,
+    tooth_row$x_distal, tooth_row$y_distal, tooth_row$z_distal,
+    tooth_row$x_buccal, tooth_row$y_buccal, tooth_row$z_buccal,
+    tooth_row$x_lingual, tooth_row$y_lingual, tooth_row$z_lingual,
+    tooth_row$MD_unit_x, tooth_row$MD_unit_y,
+    tooth_row$BL_x, tooth_row$BL_y,
+    tooth_row$MD_length, tooth_row$BL_length
+  )
+  
+  if (any(is.na(required_values)) || any(!is.finite(required_values))) {
+    return(
+      ggplot() +
+        theme_void() +
+        labs(
+          title = paste(tooth_row$Model, tooth_row$tooth, tooth_row$side,
+                        "CSA section not plotted"),
+          subtitle = "Missing required incisor landmark or vector"
+        )
+    )
+  }
+  
+  extracted <- extract_incisor_intersection_2d(
+    apex = c(tooth_row$x_apex, tooth_row$y_apex, tooth_row$z_apex),
+    gumline = c(tooth_row$x_gumline, tooth_row$y_gumline, tooth_row$z_gumline),
+    mesial = c(tooth_row$x_mesial, tooth_row$y_mesial, tooth_row$z_mesial),
+    distal = c(tooth_row$x_distal, tooth_row$y_distal, tooth_row$z_distal),
+    buccal = c(tooth_row$x_buccal, tooth_row$y_buccal, tooth_row$z_buccal),
+    lingual = c(tooth_row$x_lingual, tooth_row$y_lingual, tooth_row$z_lingual),
+    MD_unit = c(tooth_row$MD_unit_x, tooth_row$MD_unit_y),
+    BL_unit = c(tooth_row$BL_x, tooth_row$BL_y),
+    MD_length = tooth_row$MD_length,
+    BL_length = tooth_row$BL_length,
+    mesh_points = mesh_points,
+    mesh_faces = mesh_faces,
+    Model = tooth_row$Model,
+    section_scale = section_scale,
+    bbox_buffer = bbox_buffer
+  )
+  
+  section_2d <- extracted$section_2d
+  
+  CSA <- if (nrow(section_2d) >= 3) {
+    polygon_area(section_2d$MD, section_2d$BL)
+  } else {
+    NA_real_
+  }
+  
+  ggplot(section_2d, aes(x = MD, y = BL)) +
+    geom_point(size = 2, alpha = 0.7) +
+    geom_polygon(fill = NA, linewidth = 1) +
+    coord_equal() +
+    theme_classic() +
+    labs(
+      title = paste(tooth_row$Model, tooth_row$tooth, tooth_row$side,
+                    "true mesh-plane CSA section"),
+      subtitle = paste0(
+        "CSA = ", round(CSA, 3),
+        "; n points = ", nrow(section_2d),
+        "; section z = ", round(extracted$section_z, 3),
+        "; reason = ", extracted$reason
+      ),
+      x = "Mesiodistal axis",
+      y = "Buccolingual axis"
+    )
+}
+
+
+
+# =============================================================================
+# Save final outputs
+# =============================================================================
+write.csv(
+  pub_table,
+  file.path(output_dir, "tooth_dimensions_summary.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  roc_summary,
+  file.path(output_dir, "cusp_RoC_subtended_angle_summary.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  csa_summary,
+  file.path(output_dir, "incisor_CSA_summary.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  roc_results,
+  file.path(output_dir, "cusp_RoC_subtended_angle_full_QC.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  csa_results,
+  file.path(output_dir, "incisor_CSA_full_QC.csv"),
+  row.names = FALSE
+)
+
+message("Dental morphology workflow complete. Outputs written to: ", output_dir)
+
+# Optional reproducibility record:
+# writeLines(capture.output(sessionInfo()), file.path(output_dir, "sessionInfo.txt"))
